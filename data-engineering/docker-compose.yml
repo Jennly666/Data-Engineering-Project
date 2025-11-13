@@ -1,0 +1,244 @@
+networks:
+  data_net:
+
+services:
+  broker:
+    image: confluentinc/cp-server:7.9.4
+    container_name: broker
+    networks: [data_net]
+    ports:
+      - "19092:9092"
+    environment:
+      CLUSTER_ID: q5HBv2k7QyCtb2m3VgG2WQ
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_NODE_ID: "1"
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@broker:9093"
+
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://broker:29092,EXTERNAL://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+      KAFKA_CONFLUENT_TELEMETRY_ENABLED: "false"
+      KAFKA_CONFLUENT_SUPPORT_METRICS_ENABLE: "false"
+      KAFKA_CONFLUENT_METRICS_ENABLE: "false"
+      KAFKA_METRIC_REPORTERS: ""
+
+      KAFKA_CONFLUENT_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_CONFLUENT_CLUSTER_LINK_METADATA_TOPIC_REPLICATION_FACTOR: "1"
+
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:19092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.4
+    container_name: schema-registry
+    networks: [data_net]
+    depends_on:
+      broker:
+        condition: service_started
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: "broker:29092"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.9.4
+    container_name: control-center
+    networks: [data_net]
+    depends_on:
+      broker:
+        condition: service_started
+      schema-registry:
+        condition: service_started
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: "broker:29092"
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      CONFLUENT_METRICS_ENABLE: "false"
+      PORT: 9021
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9021/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  kafka-init:
+    image: confluentinc/cp-server:7.9.4
+    networks: [data_net]
+    depends_on:
+      broker:
+        condition: service_started
+    entrypoint: ["/bin/bash","-lc","kafka-topics --bootstrap-server broker:29092 --create --if-not-exists --topic users_created --replication-factor 1 --partitions 1 && sleep 1"]
+
+
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    networks: [data_net]
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  webserver:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: airflow-web
+    networks: [data_net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__SECRET_KEY: this_is_a_very_secured_key
+      AIRFLOW__WEBSERVER__AUTHENTICATE: "True"
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+        airflow db migrate &&
+        exec airflow webserver
+      "
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ]"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  scheduler:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: airflow-scheduler
+    networks: [data_net]
+    depends_on:
+      webserver:
+        condition: service_started
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__WEBSERVER__SECRET_KEY: this_is_a_very_secured_key
+    command: >
+      bash -lc "
+        set -euo pipefail &&
+        pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+        airflow db migrate &&
+        exec airflow scheduler
+      "
+    restart: unless-stopped
+
+
+  spark-master:
+    image: spark:3.5.7-python3
+    container_name: spark-master
+    networks: [data_net]
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    ports:
+      - "9090:8080"
+      - "7077:7077"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080 | grep -i 'Spark Master' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  spark-worker:
+    image: spark:3.5.7-python3
+    container_name: spark-worker
+    networks: [data_net]
+    depends_on:
+      spark-master:
+        condition: service_started
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_MASTER_URL: spark://spark-master:7077
+
+  spark-job:
+    image: spark:3.5.7-python3
+    container_name: spark-job
+    networks: [data_net]
+    depends_on:
+      broker:
+        condition: service_started
+      cassandra_db:
+        condition: service_started
+      spark-master:
+        condition: service_started
+    environment:
+      HOME: /tmp
+      PYSPARK_PYTHON: python3
+      PYTHONPATH: /opt/app/libs
+    volumes:
+      - ./script:/opt/app
+    entrypoint: ["/bin/bash","-lc",
+      "set -e && \
+      mkdir -p /opt/app/libs /tmp/.ivy2 && \
+      python3 -m pip install --no-cache-dir --target /opt/app/libs cassandra-driver && \
+      echo 'Waiting for Cassandra:9042...' && \
+      until (</dev/tcp/cassandra/9042) >/dev/null 2>&1; do sleep 2; done && \
+      echo 'Cassandra port is open' && \
+      /opt/spark/bin/spark-submit \
+        --master spark://spark-master:7077 \
+        --conf spark.jars.ivy=/tmp/.ivy2 \
+        --packages com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0 \
+        /opt/app/spark_stream.py"
+    ]
+
+
+
+  cassandra_db:
+    image: cassandra:4.1
+    container_name: cassandra
+    hostname: cassandra
+    networks: [data_net]
+    ports:
+      - "9042:9042"
+    environment:
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 100M
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'SHOW VERSION' 2>/dev/null | grep -i 'Release' >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
